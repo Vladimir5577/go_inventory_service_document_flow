@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -111,10 +113,18 @@ func (s *ImportService) Import(ctx context.Context, path string, format parser.F
 	}
 
 	err = repository.ExecTx(ctx, s.db, func(tx pgx.Tx) error {
+		if err := lockImportNumbers(ctx, tx, res.Rows); err != nil {
+			return err
+		}
 		names := make([]string, 0, len(res.Rows))
 		for _, r := range res.Rows {
 			names = append(names, r.ItemName)
 		}
+		// EnsureItems блокирует строки каталога: порядок должен совпадать у
+		// разных файлов. Stable сохраняет первое написание одинаковых имён.
+		sort.SliceStable(names, func(i, j int) bool {
+			return model.NormalizeName(names[i]) < model.NormalizeName(names[j])
+		})
 		itemIndex, itemsCreated, err := repository.EnsureItems(ctx, tx, names)
 		if err != nil {
 			return fmt.Errorf("каталог позиций: %w", err)
@@ -178,6 +188,17 @@ func (s *ImportService) Import(ctx context.Context, path string, format parser.F
 				}
 
 			case parser.FormatRegistry:
+				if in.InvNumber == nil {
+					// «б/н» не подтверждает пересчёт и не заменяет уже учтённый агрегат.
+					created, _, err := s.upsertHolding(ctx, tx, in, true)
+					if err != nil {
+						return err
+					}
+					if created {
+						report.HoldingsCreated++
+					}
+					continue
+				}
 				// Реестр РАСЩЕПЛЯЕТ: уменьшает агрегат на 1 и заводит экземпляр.
 				// Сумма при этом не меняется.
 				//
@@ -278,6 +299,32 @@ func (s *ImportService) Import(ctx context.Context, path string, format parser.F
 	return report, nil
 }
 
+// lockImportNumbers резервирует и ещё отсутствующие номера до EnsureItems и
+// любых изменений остатков. Иначе два импорта разных позиций расщепят два
+// агрегата, а UNIQUE inv_number_norm сохранит только один экземпляр.
+func lockImportNumbers(ctx context.Context, tx pgx.Tx, rows []parser.Row) error {
+	const namespace int32 = 0x57485249 // WHRI: warehouse import.
+	var buckets [256]bool
+	for _, row := range rows {
+		if norm, ok := model.NormalizeInvNumber(row.InvNumber); ok {
+			h := fnv.New64a()
+			_, _ = h.Write([]byte("warehouse-import-inv:" + norm))
+			buckets[h.Sum64()%uint64(len(buckets))] = true
+		}
+	}
+	// Не более 256 общих ключей независимо от размера файла. Коллизия лишь
+	// сериализует номера; возрастающий порядок исключает инверсию захвата.
+	for bucket, needed := range buckets {
+		if !needed {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, namespace, int32(bucket)); err != nil {
+			return fmt.Errorf("блокировка инвентарного номера: %w", err)
+		}
+	}
+	return nil
+}
+
 func (s *ImportService) buildHolding(
 	ctx context.Context, tx pgx.Tx, row parser.Row, itemID int64,
 	fioIndex, deptIndex map[string]int64, warehouseIndex map[string]int64,
@@ -351,6 +398,7 @@ func (s *ImportService) buildHolding(
 }
 
 // upsertHolding вставляет строку либо обновляет её по естественному ключу.
+// keepQty сохраняет количество номерной строки, а безномерную не меняет целиком.
 //
 // ⚠ УЖЕ ПРОСТАВЛЕННЫЙ qty_actual НЕ ЗАТИРАЕТСЯ. Повторная загрузка того же
 // файла — обычное дело (бухгалтерия прислала свежую выгрузку в середине
@@ -380,6 +428,7 @@ func (s *ImportService) upsertHolding(
 			source_sheet  = EXCLUDED.source_sheet,
 			source_row    = EXCLUDED.source_row,
 			updated_at    = NOW()
+		WHERE NOT $19
 		RETURNING (xmax = 0) AS inserted, qty_split
 	`
 	// Конфликт ловим по тому ключу, который применим к этой строке:
@@ -417,12 +466,16 @@ func (s *ImportService) upsertHolding(
 		qtyExpr = "wh_holding.qty_expected"
 	}
 
+	skipExisting := keepQty && invNorm == nil
 	err = tx.QueryRow(ctx, fmt.Sprintf(q, conflict, qtyExpr),
 		in.ItemID, in.HolderType, in.UserID, in.UserFIO,
 		in.DepartmentID, in.DepartmentName, in.WarehouseID, in.Room,
 		invNumber, invNorm, in.SerialNumber,
 		in.QtyExpected, in.QtyActual, in.Outcome, in.Note,
-		in.SourceFile, in.SourceSheet, in.SourceRow).Scan(&inserted, &qtySplit)
+		in.SourceFile, in.SourceSheet, in.SourceRow, skipExisting).Scan(&inserted, &qtySplit)
+	if err == pgx.ErrNoRows && skipExisting {
+		return false, decimal.Zero, nil
+	}
 	if err != nil {
 		return false, decimal.Zero, fmt.Errorf("строка %s:%v: %w", in.SourceFile, in.SourceRow, err)
 	}

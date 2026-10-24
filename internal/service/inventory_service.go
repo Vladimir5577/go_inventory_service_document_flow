@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 
 	"github.com/shopspring/decimal"
 
@@ -51,8 +52,6 @@ func requireAdmin(ctx context.Context) (middleware.UserClaims, error) {
 	return user, nil
 }
 
-// ---------------------------------------------------------------------------
-
 type ItemService struct {
 	items    *repository.ItemRepository
 	holdings *repository.HoldingRepository
@@ -96,8 +95,6 @@ func (s *ItemService) Update(ctx context.Context, id int64, upd repository.ItemU
 	}
 	return s.items.Update(ctx, id, upd)
 }
-
-// ---------------------------------------------------------------------------
 
 type HoldingService struct {
 	holdings *repository.HoldingRepository
@@ -181,8 +178,6 @@ func (s *HoldingService) Rooms(ctx context.Context) ([]string, error) {
 	return s.holdings.Rooms(ctx)
 }
 
-// ---------------------------------------------------------------------------
-
 type WarehouseService struct {
 	warehouses *repository.WarehouseRepository
 }
@@ -220,6 +215,11 @@ func (s *WarehouseService) Update(ctx context.Context, id int64, in repository.W
 func DecimalPtr(s string) (*decimal.Decimal, error) {
 	if s == "" {
 		return nil, nil
+	}
+	// «1e2147483647» — 13 байт, но пересчёт масштаба в decimal на нём зависает
+	// надолго. Количеству экспонента не нужна, длинные строки тоже.
+	if len(s) > 32 || strings.ContainsAny(s, "eE") {
+		return nil, apperr.New(apperr.CodeInvalidQuantity, "invalid quantity")
 	}
 	d, err := decimal.NewFromString(s)
 	if err != nil {

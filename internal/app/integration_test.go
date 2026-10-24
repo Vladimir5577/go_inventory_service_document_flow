@@ -28,7 +28,6 @@ import (
 	"go_warehouse_service/internal/helper"
 )
 
-// ---------------------------------------------------------------------------
 // Сквозная проверка сервиса против НАСТОЯЩЕЙ базы.
 //
 // Проверяет ровно то, что перечислено в критериях приёмки:
@@ -45,7 +44,6 @@ import (
 //	  -e POSTGRES_DB=warehouse_test -p 55434:5432 postgres:16.4
 //	GOOSE_DRIVER=postgres GOOSE_DBSTRING=... goose up
 //	WAREHOUSE_TEST_DSN="postgresql://root:password@localhost:55434/warehouse_test?sslmode=disable" go test ./internal/app/...
-// ---------------------------------------------------------------------------
 
 type testEnv struct {
 	t       *testing.T
@@ -287,8 +285,6 @@ func (e *testEnv) count(query string, args ...any) int {
 	}
 	return n
 }
-
-// ---------------------------------------------------------------------------
 
 // TestAuth — критерий приёмки №1.
 func TestAuth(t *testing.T) {
@@ -798,6 +794,7 @@ func TestImportRealFiles(t *testing.T) {
 	// и сводка сложила бы их вместе.
 	if reg := inventFile(t, "инвентаризация"); reg != "" {
 		before := totalQty
+		lastID := e.count(`SELECT COALESCE(MAX(id), 0) FROM wh_holding`)
 		rep := upload(reg, "registry")
 
 		var after string
@@ -807,11 +804,14 @@ func TestImportRealFiles(t *testing.T) {
 		created := int(rep["holdingsCreated"].(float64))
 		t.Logf("реестр: расщеплено %d, создано %d строк", split, created)
 
-		// Расщепление суммы не меняет; строки, под которые агрегата не нашлось,
-		// заводятся излишком с qty_expected = 0 и тоже не меняют сумму.
-		if after != before {
+		// Номерные строки суммы не меняют. Новые «б/н» добавляют ожидаемое
+		// количество; исключаем его вместе с отщеплёнными от них экземплярами.
+		afterWithoutNewAggregates := e.scalar(`SELECT (SUM(qty_expected) - COALESCE(
+			SUM(qty_expected + qty_split) FILTER (WHERE id > $1 AND inv_number_norm IS NULL), 0))::text
+			FROM wh_holding`, lastID)
+		if afterWithoutNewAggregates != before {
 			t.Errorf("после импорта реестра сумма стала %s (была %s) — "+
-				"реестр добавил количество вместо расщепления", after, before)
+				"реестр изменил количество помимо новых безномерных строк", afterWithoutNewAggregates, before)
 		}
 
 		// Номерные строки обязаны появиться и иметь ровно 0 или 1 в учёте.
@@ -833,9 +833,9 @@ func TestImportRealFiles(t *testing.T) {
 		upload(reg, "registry")
 		var afterTwice string
 		_ = e.db.QueryRow(ctx, `SELECT SUM(qty_expected)::text FROM wh_holding`).Scan(&afterTwice)
-		if afterTwice != before {
+		if afterTwice != after {
 			t.Errorf("повторный импорт реестра изменил сумму: %s против %s "+
-				"(расщепление выполнено дважды)", afterTwice, before)
+				"(расщепление выполнено дважды)", afterTwice, after)
 		}
 		var negative int
 		_ = e.db.QueryRow(ctx,
@@ -960,7 +960,7 @@ func TestImportRepeatAfterSplit(t *testing.T) {
 // проверена по коду:
 //   - выбор уменьшаемого агрегата зависел от ПОРЯДКА обработки 2174 строк
 //     реестра (ORDER BY qty_expected DESC по полю, которое тут же меняется,
-//     import_service.go:461 и :493) — из финального состояния он не выводится;
+//     import_service.go, splitAggregate, шаги 1 и 2) — из финального состояния он не выводится;
 //   - предикат «был расщеплён» отсутствует: POST /holdings проверяет только
 //     неотрицательность (inventory_service.go), поэтому номерная строка,
 //     заведённая владельцем руками, от расщеплённой неотличима;
